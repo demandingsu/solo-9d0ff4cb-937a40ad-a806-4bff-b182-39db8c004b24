@@ -29,7 +29,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -489,6 +489,356 @@ def next_delivery_no(conn: sqlite3.Connection, sample_date: str) -> str:
     ).fetchone():
         n += 1
     return f"{prefix}{n:03d}"
+
+
+# ---------------------------------------------------------------------------
+# Well readings and removal-mass accounting
+# ---------------------------------------------------------------------------
+
+def row_to_reading(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "well_no": row["well_no"],
+        "read_at_utc": row["read_at_utc"],
+        "cumulative_m3": row["cumulative_m3"],
+        "created_at_utc": row["created_at_utc"],
+    }
+
+
+def reading_hash(read_at_utc: str, cumulative_m3: float) -> str:
+    return sha256_text(
+        canonical_json({"read_at_utc": read_at_utc, "cumulative_m3": cumulative_m3})
+    )
+
+
+def get_readings(conn: sqlite3.Connection, well_no: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM well_readings WHERE well_no = ? ORDER BY read_at_utc ASC, id ASC",
+        (well_no,),
+    ).fetchall()
+
+
+def well_exists(conn: sqlite3.Connection, well_no: str) -> bool:
+    if conn.execute("SELECT 1 FROM well_readings WHERE well_no = ? LIMIT 1", (well_no,)).fetchone():
+        return True
+    return conn.execute("SELECT 1 FROM samples WHERE location = ? LIMIT 1", (well_no,)).fetchone() is not None
+
+
+def load_well_inputs(
+    conn: sqlite3.Connection, well_no: str
+) -> tuple[list[sqlite3.Row], list[dict[str, Any]]]:
+    """Load every reading and every sample (with custody + measurements) for a well.
+
+    The accounting basis is deliberately the *whole* committed state of the
+    well, loaded inside the caller's write transaction, so the resulting
+    ``inputs_token`` proves exactly which committed state a run was computed
+    from.
+    """
+    readings = get_readings(conn, well_no)
+    samples = conn.execute(
+        "SELECT * FROM samples WHERE location = ? ORDER BY sampled_at_utc ASC, id ASC",
+        (well_no,),
+    ).fetchall()
+    bundles = [
+        {
+            "sample": s,
+            "handovers": get_handovers(conn, s["id"]),
+            "measurements": get_measurements(conn, s["id"]),
+        }
+        for s in samples
+    ]
+    return readings, bundles
+
+
+def accounting_inputs_token(
+    *,
+    well_no: str,
+    lab: str,
+    analyte: str,
+    day: str,
+    carry_over_hours: float,
+    max_interval_hours: float,
+    readings: list[sqlite3.Row],
+    bundles: list[dict[str, Any]],
+) -> str:
+    """Hash of the exact committed state an accounting run is computed from."""
+    payload = {
+        "well_no": well_no,
+        "lab": lab,
+        "analyte": analyte,
+        "day": day,
+        "carry_over_hours": carry_over_hours,
+        "max_interval_hours": max_interval_hours,
+        "readings": [
+            {"id": r["id"], "read_at_utc": r["read_at_utc"], "cumulative_m3": r["cumulative_m3"]}
+            for r in readings
+        ],
+        "samples": [
+            {
+                "id": b["sample"]["id"],
+                "sample_code": b["sample"]["sample_code"],
+                "sampled_at_utc": b["sample"]["sampled_at_utc"],
+                "collector": b["sample"]["collector"],
+                "reporting_lab": b["sample"]["reporting_lab"],
+                "handovers": [
+                    {
+                        "seq": h["seq"],
+                        "from_party": h["from_party"],
+                        "to_party": h["to_party"],
+                        "handed_at_utc": h["handed_at_utc"],
+                    }
+                    for h in sorted(b["handovers"], key=lambda x: x["seq"])
+                ],
+                "measurements": [
+                    {
+                        "lab": m["lab"],
+                        "analyte": m["analyte"],
+                        "concentration": m["concentration"],
+                        "unit": m["unit"],
+                    }
+                    for m in sorted(b["measurements"], key=lambda x: (x["lab"], x["analyte"]))
+                ],
+            }
+            for b in bundles
+        ],
+    }
+    return sha256_text(canonical_json(payload))
+
+
+def row_to_accounting_run(row: sqlite3.Row, *, include_result: bool = True) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": row["id"],
+        "well_no": row["well_no"],
+        "lab": row["lab"],
+        "analyte": row["analyte"],
+        "day": row["day"],
+        "status": row["status"],
+        "carry_over_hours": row["carry_over_hours"],
+        "max_interval_hours": row["max_interval_hours"],
+        "inputs_token": row["inputs_token"],
+        "removal_mass_g": row["removal_mass_g"],
+        "complete": bool(row["complete"]),
+        "created_at_utc": row["created_at_utc"],
+        "expired_at_utc": row["expired_at_utc"],
+        "expire_reason": row["expire_reason"],
+        "superseded_at_utc": row["superseded_at_utc"],
+    }
+    if include_result:
+        result["result"] = json.loads(row["result_json"])
+    return result
+
+
+def expire_accounting_runs(
+    conn: sqlite3.Connection,
+    well_no: str,
+    day_lo: str,
+    day_hi: str,
+    reason: str,
+    now_iso: str,
+) -> list[dict[str, Any]]:
+    """Mark every *current* run for ``well_no`` with day in [day_lo, day_hi] expired.
+
+    Expired runs are kept (status + reason + timestamp) and never served as
+    current again; a successful recalculation creates a new current run.
+    """
+    rows = conn.execute(
+        "SELECT id, lab, analyte, day FROM accounting_runs"
+        " WHERE well_no = ? AND status = 'current' AND day >= ? AND day <= ?"
+        " ORDER BY id ASC",
+        (well_no, day_lo, day_hi),
+    ).fetchall()
+    conn.execute(
+        "UPDATE accounting_runs SET status = 'expired', expired_at_utc = ?, expire_reason = ?"
+        " WHERE well_no = ? AND status = 'current' AND day >= ? AND day <= ?",
+        (now_iso, reason, well_no, day_lo, day_hi),
+    )
+    return [
+        {"run_id": r["id"], "lab": r["lab"], "analyte": r["analyte"], "day": r["day"], "reason": reason}
+        for r in rows
+    ]
+
+
+def expire_accounting_for_reading_change(
+    conn: sqlite3.Connection,
+    well_no: str,
+    timestamps: list[str],
+    reason: str,
+    now_iso: str,
+) -> list[dict[str, Any]]:
+    """Expire runs whose day overlaps the metering intervals touched by a reading change.
+
+    ``timestamps`` are the changed readings' timestamps (old and new).  The
+    affected range spans the neighbouring readings on each side, because the
+    intervals between them are exactly what changed.  Must be called after the
+    write is applied, inside the same transaction.
+    """
+    points: list[str] = []
+    for t in timestamps:
+        if not t:
+            continue
+        points.append(t)
+        prev = conn.execute(
+            "SELECT read_at_utc FROM well_readings WHERE well_no = ? AND read_at_utc < ?"
+            " ORDER BY read_at_utc DESC LIMIT 1",
+            (well_no, t),
+        ).fetchone()
+        nxt = conn.execute(
+            "SELECT read_at_utc FROM well_readings WHERE well_no = ? AND read_at_utc > ?"
+            " ORDER BY read_at_utc ASC LIMIT 1",
+            (well_no, t),
+        ).fetchone()
+        if prev:
+            points.append(prev["read_at_utc"])
+        if nxt:
+            points.append(nxt["read_at_utc"])
+    if not points:
+        return []
+    return expire_accounting_runs(conn, well_no, min(points)[:10], max(points)[:10], reason, now_iso)
+
+
+def expire_accounting_for_sample_change(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row,
+    reason: str,
+    now_iso: str,
+) -> list[dict[str, Any]]:
+    """Expire runs whose day overlaps the period whose concentration basis is this sample.
+
+    A sample (or its custody/measurements) is the concentration basis from its
+    ``sampled_at_utc`` until the next sample at the same location; only runs
+    for days overlapping that window can be affected.  Must be called inside
+    the same transaction as the change itself.
+    """
+    well_no = sample["location"]
+    sampled_at = sample["sampled_at_utc"]
+    nxt = conn.execute(
+        "SELECT sampled_at_utc FROM samples WHERE location = ? AND id != ? AND sampled_at_utc > ?"
+        " ORDER BY sampled_at_utc ASC LIMIT 1",
+        (well_no, sample["id"], sampled_at),
+    ).fetchone()
+    day_lo = sampled_at[:10]
+    day_hi = nxt["sampled_at_utc"][:10] if nxt else "9999-12-31"
+    return expire_accounting_runs(conn, well_no, day_lo, day_hi, reason, now_iso)
+
+
+def build_accounting_run(
+    conn: sqlite3.Connection,
+    *,
+    well_no: str,
+    lab: str,
+    analyte: str,
+    day: str,
+    carry_over_hours: float,
+    now_iso: str,
+) -> tuple[sqlite3.Row, bool]:
+    """Calculate one well/lab/analyte/day and persist the run, atomically.
+
+    Returns ``(run_row, recomputed)``.  When a current run already exists for
+    the same committed inputs and parameters it is returned unchanged
+    (``recomputed=False``).  Otherwise the day is computed from the committed
+    state visible in *this* transaction, any previous current run is
+    superseded and the new run becomes the only current one.  Expired runs are
+    left untouched (kept for audit).  Caller must hold a write transaction.
+    """
+    from . import accounting  # local import: keeps the engine dependency one-way
+
+    readings, bundles = load_well_inputs(conn, well_no)
+    token = accounting_inputs_token(
+        well_no=well_no,
+        lab=lab,
+        analyte=analyte,
+        day=day,
+        carry_over_hours=carry_over_hours,
+        max_interval_hours=accounting.MAX_INTERVAL_HOURS,
+        readings=readings,
+        bundles=bundles,
+    )
+    current = conn.execute(
+        "SELECT * FROM accounting_runs"
+        " WHERE well_no = ? AND lab = ? AND analyte = ? AND day = ? AND status = 'current'"
+        " ORDER BY id DESC LIMIT 1",
+        (well_no, lab, analyte, day),
+    ).fetchone()
+    if (
+        current is not None
+        and current["inputs_token"] == token
+        and float(current["carry_over_hours"]) == carry_over_hours
+    ):
+        return current, False
+
+    engine_readings = [
+        {
+            "id": r["id"],
+            "read_at": parse_utc(r["read_at_utc"], "read_at_utc"),
+            "cumulative_m3": float(r["cumulative_m3"]),
+        }
+        for r in readings
+    ]
+    engine_samples = []
+    for bundle in bundles:
+        sample = bundle["sample"]
+        elig = evaluate_eligibility(conn, sample)
+        measurement = next(
+            (m for m in bundle["measurements"] if m["lab"] == lab and m["analyte"] == analyte),
+            None,
+        )
+        unit = measurement["unit"] if measurement else None
+        concentration = (
+            float(measurement["concentration"])
+            if measurement is not None and unit == accounting.REQUIRED_UNIT
+            else None
+        )
+        problems = list(elig.problems)
+        if measurement is None:
+            problems.append(f"no measurement for lab '{lab}' / analyte '{analyte}'")
+        elif unit != accounting.REQUIRED_UNIT:
+            problems.append(f"measurement unit '{unit}' is not {accounting.REQUIRED_UNIT}")
+        engine_samples.append(
+            {
+                "id": sample["id"],
+                "sample_code": sample["sample_code"],
+                "sampled_at": parse_utc(sample["sampled_at_utc"], "sampled_at_utc"),
+                "qualified": elig.ok and concentration is not None,
+                "concentration": concentration,
+                "unit": unit,
+                "problems": problems,
+            }
+        )
+    result = accounting.compute_day(
+        well_no=well_no,
+        lab=lab,
+        analyte=analyte,
+        day=date.fromisoformat(day),
+        carry_over_hours=carry_over_hours,
+        readings=engine_readings,
+        samples=engine_samples,
+    )
+    conn.execute(
+        "UPDATE accounting_runs SET status = 'superseded', superseded_at_utc = ?"
+        " WHERE well_no = ? AND lab = ? AND analyte = ? AND day = ? AND status = 'current'",
+        (now_iso, well_no, lab, analyte, day),
+    )
+    cur = conn.execute(
+        "INSERT INTO accounting_runs (well_no, lab, analyte, day, carry_over_hours, max_interval_hours,"
+        " status, inputs_token, removal_mass_g, complete, result_json, created_at_utc)"
+        " VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?, ?, ?, ?)",
+        (
+            well_no,
+            lab,
+            analyte,
+            day,
+            carry_over_hours,
+            accounting.MAX_INTERVAL_HOURS,
+            token,
+            result["removal_mass_g"],
+            1 if result["complete"] else 0,
+            canonical_json(result),
+            now_iso,
+        ),
+    )
+    run = conn.execute("SELECT * FROM accounting_runs WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+    return run, True
+
 
 
 def delivery_public(conn: sqlite3.Connection, delivery: sqlite3.Row, include_revoked: bool = True) -> dict[str, Any]:

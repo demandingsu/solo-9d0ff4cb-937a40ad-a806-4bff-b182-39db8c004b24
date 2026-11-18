@@ -1,4 +1,4 @@
-"""FastAPI application: groundwater sample delivery data supply API."""
+"""FastAPI application: groundwater sample delivery + well removal accounting API."""
 from __future__ import annotations
 
 import json
@@ -11,10 +11,10 @@ from typing import Any
 from fastapi import FastAPI, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import db, domain
+from . import accounting, db, domain
 from .domain import ApiError
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,51 @@ class DeliveryCreate(BaseModel):
     )
 
 
+class ReadingCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {"read_at_utc": "2026-11-18T08:00:00Z", "cumulative_m3": 1234.5}
+        }
+    )
+    read_at_utc: str = Field(description="ISO-8601 timestamp with explicit UTC offset, e.g. 2026-11-18T08:00:00Z")
+    cumulative_m3: float = Field(description="Cumulative pumped volume meter reading in cubic metres")
+
+
+class ReadingCorrect(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "read_at_utc": "2026-11-18T08:00:00Z",
+                "cumulative_m3": 1243.5,
+                "reason": "transposed digits against the meter logbook",
+            }
+        }
+    )
+    read_at_utc: str = Field(description="ISO-8601 timestamp with explicit UTC offset")
+    cumulative_m3: float
+    reason: str = Field(min_length=1, max_length=1000, description="Mandatory: corrections are explicit and auditable")
+
+
+class AccountingCalculate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "lab": "Central Water Laboratory",
+                "analyte": "nitrate-N",
+                "day": "2026-11-18",
+                "carry_over_hours": 72.0,
+            }
+        }
+    )
+    lab: str = Field(min_length=1, max_length=200)
+    analyte: str = Field(min_length=1, max_length=200)
+    day: str = Field(description="UTC day to account, YYYY-MM-DD")
+    carry_over_hours: float = Field(
+        default=accounting.DEFAULT_CARRY_OVER_HOURS,
+        description="How long a qualified concentration may be carried over after sampling",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
@@ -140,11 +185,11 @@ def _clean(value: str, field_name: str) -> str:
     return trimmed
 
 
-def _parse_date(value: str) -> str:
+def _parse_date(value: str, field: str = "sample_date") -> str:
     try:
         parsed = date.fromisoformat(value.strip())
     except ValueError:
-        raise ApiError(422, "invalid_date", "sample_date must be YYYY-MM-DD")
+        raise ApiError(422, "invalid_date", f"{field} must be YYYY-MM-DD")
     return parsed.isoformat()
 
 
@@ -154,6 +199,28 @@ def _finite_concentration(value: float) -> float:
     if value < 0:
         raise ApiError(422, "invalid_concentration", "concentration must not be negative")
     return float(value)
+
+
+def _finite_reading(value: float) -> float:
+    if not math.isfinite(value):
+        raise ApiError(422, "invalid_reading", "cumulative_m3 must be a finite number")
+    if value < 0:
+        raise ApiError(422, "invalid_reading", "cumulative_m3 must not be negative")
+    return float(value)
+
+
+def _carry_over_hours(value: float) -> float:
+    if not math.isfinite(value) or value <= 0 or value > 24 * 365:
+        raise ApiError(
+            422,
+            "invalid_carry_over",
+            "carry_over_hours must be a finite number in (0, 8760]",
+        )
+    return float(value)
+
+
+def _well_no(value: str) -> str:
+    return _clean(value, "well_no")
 
 
 def _sample_code(conn: sqlite3.Connection, sample_date: str) -> str:
@@ -294,9 +361,22 @@ app = FastAPI(
         "every active delivery from serving only the affected sample, recording the "
         "reason. Other samples are unaffected. A corrected sample is not restored to "
         "an old delivery even if its chain is later repaired: issue a new delivery.\n\n"
+        "**Well removal accounting**\n"
+        "`POST /wells/{well_no}/readings` registers cumulative pumped-volume meter "
+        "readings (m3) per well; the well number corresponds to the samples' "
+        "`location`. `POST /wells/{well_no}/accounting` accounts one UTC day for a "
+        "well / laboratory / analyte: adjacent readings form metering intervals with "
+        "volume spread uniformly over time; the day is cut at day boundaries, new "
+        "sample events and carry-over expiries; each segment uses the newest "
+        "custody-qualified mg/L concentration at its start. Reading rollback, "
+        "intervals over 24 h, missing valid concentrations and uncovered days are "
+        "reported as pending intervals — unknown is never treated as zero. "
+        "Late samples, corrected readings or revised custody/measurements expire the "
+        "affected runs (kept for audit); a successful recalculation becomes the new "
+        "current run atomically.\n\n"
         "Every write runs in a single SQLite `BEGIN IMMEDIATE` transaction, so "
-        "corrections, measurement entry and publishing never observe or persist a "
-        "partially committed state."
+        "corrections, measurement entry, publishing and accounting never observe or "
+        "persist a partially committed state."
     ),
     lifespan=lifespan,
 )
@@ -337,12 +417,20 @@ def create_sample(body: SampleCreate) -> dict[str, Any]:
         )
         row = _load_sample_or_404(conn, int(cur.lastrowid))
         elig = domain.evaluate_eligibility(conn, row)
+        expired = domain.expire_accounting_for_sample_change(
+            conn,
+            row,
+            f"sample {code} registered at {row['sampled_at_utc']} for location '{location}'; "
+            "it may become the concentration basis from its sampling time onward",
+            now,
+        )
         result = domain.row_to_sample(row)
         result["handovers"] = []
         result["measurements"] = []
         result["chain"] = elig.chain.as_dict()
         result["eligible_for_delivery"] = elig.ok
         result["eligibility_problems"] = elig.problems
+        result["expired_accounting"] = expired
     return result
 
 
@@ -470,11 +558,18 @@ def add_handover(body: HandoverCreate, sample_id: int = Path(ge=1), response: Re
             "the delivery snapshot no longer matches committed custody state. Republish.",
             now,
         )
+        expired = domain.expire_accounting_for_sample_change(
+            conn,
+            sample,
+            f"handover seq {body.seq} added to sample {sample_id}; custody qualification may have changed",
+            now,
+        )
     return {
         "idempotent": False,
         "handover": domain.row_to_handover(row),
         "chain": chain.as_dict(),
         "revoked_deliveries": revoked,
+        "expired_accounting": expired,
     }
 
 
@@ -510,6 +605,7 @@ def correct_handover(
                 "handover": domain.row_to_handover(existing),
                 "chain": domain.evaluate_chain(sample, domain.get_handovers(conn, sample_id)).as_dict(),
                 "revoked_deliveries": [],
+                "expired_accounting": [],
             }
         _validate_handover(
             conn,
@@ -535,6 +631,12 @@ def correct_handover(
             "The old delivery no longer provides this sample and is not restored automatically; republish."
         )
         revoked = domain.revoke_sample_from_deliveries(conn, sample_id, revoke_reason, now)
+        expired = domain.expire_accounting_for_sample_change(
+            conn,
+            sample,
+            f"handover seq {seq} of sample {sample_id} substantively corrected; reason: {reason}",
+            now,
+        )
         row = conn.execute("SELECT * FROM handovers WHERE id = ?", (existing["id"],)).fetchone()
         chain = domain.evaluate_chain(sample, domain.get_handovers(conn, sample_id))
     return {
@@ -543,6 +645,7 @@ def correct_handover(
         "handover": domain.row_to_handover(row),
         "chain": chain.as_dict(),
         "revoked_deliveries": revoked,
+        "expired_accounting": expired,
     }
 
 
@@ -637,10 +740,17 @@ def add_measurement(body: MeasurementCreate, sample_id: int = Path(ge=1), respon
             "the delivery snapshot no longer matches committed measurement state. Republish.",
             now,
         )
+        expired = domain.expire_accounting_for_sample_change(
+            conn,
+            sample,
+            f"measurement {lab}/{analyte} added to sample {sample_id}; concentration basis may have changed",
+            now,
+        )
     return {
         "idempotent": False,
         "measurement": domain.row_to_measurement(row),
         "revoked_deliveries": revoked,
+        "expired_accounting": expired,
     }
 
 
@@ -661,7 +771,7 @@ def correct_measurement(
     reason = _clean(body.reason, "reason")
     now = domain.utc_now_iso()
     with db.write_tx() as conn:
-        _load_sample_or_404(conn, sample_id)
+        sample = _load_sample_or_404(conn, sample_id)
         existing = conn.execute(
             "SELECT * FROM measurements WHERE id = ? AND sample_id = ?", (measurement_id, sample_id)
         ).fetchone()
@@ -674,6 +784,7 @@ def correct_measurement(
                 "reason": "content unchanged; no correction recorded",
                 "measurement": domain.row_to_measurement(existing),
                 "revoked_deliveries": [],
+                "expired_accounting": [],
             }
         clash = conn.execute(
             "SELECT 1 FROM measurements WHERE sample_id = ? AND lab = ? AND analyte = ? AND id != ?",
@@ -709,12 +820,312 @@ def correct_measurement(
             "The old delivery no longer provides this sample and is not restored automatically; republish."
         )
         revoked = domain.revoke_sample_from_deliveries(conn, sample_id, revoke_reason, now)
+        expired = domain.expire_accounting_for_sample_change(
+            conn,
+            sample,
+            f"measurement {lab}/{analyte} of sample {sample_id} substantively corrected; reason: {reason}",
+            now,
+        )
     return {
         "corrected": True,
         "substantive": True,
         "measurement": domain.row_to_measurement(row),
         "revoked_deliveries": revoked,
+        "expired_accounting": expired,
     }
+
+
+# ---------------------------------------------------------------------------
+# Wells and meter readings
+# ---------------------------------------------------------------------------
+
+@app.get("/wells", tags=["wells"], summary="List known well numbers (reading wells + sample locations)")
+def list_wells() -> dict[str, Any]:
+    with db.read_conn() as conn:
+        reading_wells = conn.execute(
+            "SELECT well_no, COUNT(*) AS n, MIN(read_at_utc) AS first_read, MAX(read_at_utc) AS last_read"
+            " FROM well_readings GROUP BY well_no"
+        ).fetchall()
+        sample_wells = conn.execute(
+            "SELECT location, COUNT(*) AS n FROM samples GROUP BY location"
+        ).fetchall()
+    wells: dict[str, dict[str, Any]] = {}
+    for r in reading_wells:
+        wells[r["well_no"]] = {
+            "well_no": r["well_no"],
+            "reading_count": r["n"],
+            "first_read_at_utc": r["first_read"],
+            "last_read_at_utc": r["last_read"],
+            "sample_count": 0,
+        }
+    for s in sample_wells:
+        entry = wells.setdefault(
+            s["location"],
+            {"well_no": s["location"], "reading_count": 0, "first_read_at_utc": None, "last_read_at_utc": None},
+        )
+        entry["sample_count"] = s["n"]
+    return {"items": sorted(wells.values(), key=lambda w: w["well_no"])}
+
+
+@app.post(
+    "/wells/{well_no}/readings",
+    status_code=status.HTTP_201_CREATED,
+    tags=["readings"],
+    summary="Register a cumulative pumped-volume reading (m3) for a well (idempotent retry)",
+)
+def add_reading(body: ReadingCreate, well_no: str = Path(min_length=1, max_length=200), response: Response = None) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    read_dt = domain.parse_utc(body.read_at_utc, "read_at_utc")
+    read_iso = domain.format_utc(read_dt)
+    cumulative = _finite_reading(body.cumulative_m3)
+    now = domain.utc_now_iso()
+    with db.write_tx() as conn:
+        existing = conn.execute(
+            "SELECT * FROM well_readings WHERE well_no = ? AND read_at_utc = ?", (well_no, read_iso)
+        ).fetchone()
+        new_hash = domain.reading_hash(read_iso, cumulative)
+        if existing is not None:
+            if existing["content_hash"] == new_hash:
+                if response is not None:
+                    response.status_code = status.HTTP_200_OK
+                return {"idempotent": True, "reading": domain.row_to_reading(existing)}
+            raise ApiError(
+                409,
+                "reading_already_exists",
+                f"a reading for well '{well_no}' at {read_iso} already exists with a different value; "
+                f"use PATCH /wells/{well_no}/readings/{existing['id']} with an explicit reason",
+                existing=domain.row_to_reading(existing),
+            )
+        cur = conn.execute(
+            "INSERT INTO well_readings (well_no, read_at_utc, cumulative_m3, content_hash, created_at_utc)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (well_no, read_iso, cumulative, new_hash, now),
+        )
+        reading_id = int(cur.lastrowid)
+        payload = domain.canonical_json({"read_at_utc": read_iso, "cumulative_m3": cumulative})
+        conn.execute(
+            "INSERT INTO well_reading_revisions (reading_id, well_no, action, prev_json, new_json, reason, created_at_utc)"
+            " VALUES (?, ?, 'create', NULL, ?, NULL, ?)",
+            (reading_id, well_no, payload, now),
+        )
+        row = conn.execute("SELECT * FROM well_readings WHERE id = ?", (reading_id,)).fetchone()
+        expired = domain.expire_accounting_for_reading_change(
+            conn,
+            well_no,
+            [read_iso],
+            f"reading #{reading_id} registered at {read_iso} ({cumulative} m3); metering intervals changed",
+            now,
+        )
+    return {"idempotent": False, "reading": domain.row_to_reading(row), "expired_accounting": expired}
+
+
+@app.get("/wells/{well_no}/readings", tags=["readings"], summary="List a well's readings in time order (rollback flagged)")
+def list_readings(well_no: str = Path(min_length=1, max_length=200)) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    with db.read_conn() as conn:
+        rows = domain.get_readings(conn, well_no)
+    items = []
+    previous: float | None = None
+    for r in rows:
+        item = domain.row_to_reading(r)
+        item["rollback_from_previous"] = previous is not None and r["cumulative_m3"] < previous
+        previous = r["cumulative_m3"]
+        items.append(item)
+    return {"well_no": well_no, "readings": items}
+
+
+@app.patch(
+    "/wells/{well_no}/readings/{reading_id}",
+    tags=["readings"],
+    summary="Explicitly correct a reading's value and/or timestamp (reason mandatory)",
+)
+def correct_reading(
+    body: ReadingCorrect,
+    well_no: str = Path(min_length=1, max_length=200),
+    reading_id: int = Path(ge=1),
+) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    read_dt = domain.parse_utc(body.read_at_utc, "read_at_utc")
+    read_iso = domain.format_utc(read_dt)
+    cumulative = _finite_reading(body.cumulative_m3)
+    reason = _clean(body.reason, "reason")
+    now = domain.utc_now_iso()
+    with db.write_tx() as conn:
+        existing = conn.execute(
+            "SELECT * FROM well_readings WHERE id = ? AND well_no = ?", (reading_id, well_no)
+        ).fetchone()
+        if existing is None:
+            raise ApiError(404, "reading_not_found", f"reading {reading_id} does not exist for well '{well_no}'")
+        old_iso = existing["read_at_utc"]
+        old_value = float(existing["cumulative_m3"])
+        new_hash = domain.reading_hash(read_iso, cumulative)
+        if new_hash == existing["content_hash"]:
+            return {
+                "corrected": False,
+                "substantive": False,
+                "reason": "content unchanged; no correction recorded",
+                "reading": domain.row_to_reading(existing),
+                "expired_accounting": [],
+            }
+        clash = conn.execute(
+            "SELECT 1 FROM well_readings WHERE well_no = ? AND read_at_utc = ? AND id != ?",
+            (well_no, read_iso, reading_id),
+        ).fetchone()
+        if clash:
+            raise ApiError(
+                409,
+                "reading_key_conflict",
+                f"another reading for well '{well_no}' already exists at {read_iso}",
+            )
+        prev_payload = domain.canonical_json({"read_at_utc": old_iso, "cumulative_m3": old_value})
+        new_payload = domain.canonical_json({"read_at_utc": read_iso, "cumulative_m3": cumulative})
+        conn.execute(
+            "UPDATE well_readings SET read_at_utc = ?, cumulative_m3 = ?, content_hash = ? WHERE id = ?",
+            (read_iso, cumulative, new_hash, reading_id),
+        )
+        conn.execute(
+            "INSERT INTO well_reading_revisions (reading_id, well_no, action, prev_json, new_json, reason, created_at_utc)"
+            " VALUES (?, ?, 'correct', ?, ?, ?, ?)",
+            (reading_id, well_no, prev_payload, new_payload, reason, now),
+        )
+        row = conn.execute("SELECT * FROM well_readings WHERE id = ?", (reading_id,)).fetchone()
+        expired = domain.expire_accounting_for_reading_change(
+            conn,
+            well_no,
+            [old_iso, read_iso],
+            f"reading #{reading_id} corrected ({old_iso} {old_value} m3 -> {read_iso} {cumulative} m3); "
+            f"reason: {reason}",
+            now,
+        )
+    return {
+        "corrected": True,
+        "substantive": True,
+        "reading": domain.row_to_reading(row),
+        "expired_accounting": expired,
+    }
+
+
+@app.get(
+    "/wells/{well_no}/readings/revisions",
+    tags=["readings"],
+    summary="Audit trail of reading registrations and corrections",
+)
+def reading_revisions(well_no: str = Path(min_length=1, max_length=200)) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    with db.read_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM well_reading_revisions WHERE well_no = ? ORDER BY id ASC", (well_no,)
+        ).fetchall()
+    return {
+        "well_no": well_no,
+        "revisions": [
+            {
+                "reading_id": r["reading_id"],
+                "action": r["action"],
+                "prev": json.loads(r["prev_json"]) if r["prev_json"] else None,
+                "new": json.loads(r["new_json"]),
+                "reason": r["reason"],
+                "created_at_utc": r["created_at_utc"],
+            }
+            for r in rows
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Removal-mass accounting
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/wells/{well_no}/accounting",
+    status_code=status.HTTP_201_CREATED,
+    tags=["accounting"],
+    summary="Calculate and persist the removal mass for one well / lab / analyte / UTC day",
+)
+def calculate_accounting(
+    body: AccountingCalculate,
+    well_no: str = Path(min_length=1, max_length=200),
+    response: Response = None,
+) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    lab = _clean(body.lab, "lab")
+    analyte = _clean(body.analyte, "analyte")
+    day = _parse_date(body.day, "day")
+    carry_over = _carry_over_hours(body.carry_over_hours)
+    now = domain.utc_now_iso()
+    with db.write_tx() as conn:
+        if not domain.well_exists(conn, well_no):
+            raise ApiError(404, "well_not_found", f"well '{well_no}' has neither readings nor samples")
+        run, recomputed = domain.build_accounting_run(
+            conn,
+            well_no=well_no,
+            lab=lab,
+            analyte=analyte,
+            day=day,
+            carry_over_hours=carry_over,
+            now_iso=now,
+        )
+        if not recomputed and response is not None:
+            response.status_code = status.HTTP_200_OK
+    return {"recomputed": recomputed, "run": domain.row_to_accounting_run(run)}
+
+
+@app.get("/wells/{well_no}/accounting", tags=["accounting"], summary="List accounting runs for a well")
+def list_accounting_runs(
+    well_no: str = Path(min_length=1, max_length=200),
+    day: str | None = Query(default=None, description="UTC day YYYY-MM-DD"),
+    lab: str | None = Query(default=None),
+    analyte: str | None = Query(default=None),
+    run_status: str | None = Query(default=None, description="current | expired | superseded"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    clauses = ["well_no = ?"]
+    params: list[Any] = [well_no]
+    if day is not None:
+        clauses.append("day = ?")
+        params.append(_parse_date(day, "day"))
+    if lab is not None:
+        clauses.append("lab = ?")
+        params.append(_clean(lab, "lab"))
+    if analyte is not None:
+        clauses.append("analyte = ?")
+        params.append(_clean(analyte, "analyte"))
+    if run_status is not None:
+        if run_status not in ("current", "expired", "superseded"):
+            raise ApiError(422, "invalid_status", "run_status must be current, expired or superseded")
+        clauses.append("status = ?")
+        params.append(run_status)
+    where = " WHERE " + " AND ".join(clauses)
+    with db.read_conn() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS n FROM accounting_runs{where}", params).fetchone()["n"])
+        rows = conn.execute(
+            f"SELECT * FROM accounting_runs{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return {
+        "items": [domain.row_to_accounting_run(r, include_result=False) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get(
+    "/wells/{well_no}/accounting/{run_id}",
+    tags=["accounting"],
+    summary="Get one accounting run with the full result (mass, pending intervals, sources)",
+)
+def get_accounting_run(well_no: str = Path(min_length=1, max_length=200), run_id: int = Path(ge=1)) -> dict[str, Any]:
+    well_no = _well_no(well_no)
+    with db.read_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounting_runs WHERE id = ? AND well_no = ?", (run_id, well_no)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "accounting_run_not_found", f"accounting run {run_id} does not exist for well '{well_no}'")
+        return domain.row_to_accounting_run(row)
 
 
 # ---------------------------------------------------------------------------

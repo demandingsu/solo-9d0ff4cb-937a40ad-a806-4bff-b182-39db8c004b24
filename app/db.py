@@ -118,6 +118,60 @@ CREATE TABLE IF NOT EXISTS sequence_counters (
     name            TEXT PRIMARY KEY,
     value           INTEGER NOT NULL
 );
+
+-- Cumulative pumped-volume meter readings (m3) per well.  A reading is
+-- identified by (well_no, read_at_utc); the well number corresponds to the
+-- samples' ``location``.  ``content_hash`` covers the business content so an
+-- identical retry is recognised and a real change must go through PATCH.
+CREATE TABLE IF NOT EXISTS well_readings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    well_no         TEXT NOT NULL,
+    read_at_utc     TEXT NOT NULL,           -- ISO-8601, canonical UTC with Z
+    cumulative_m3   REAL NOT NULL,
+    content_hash    TEXT NOT NULL,
+    created_at_utc  TEXT NOT NULL,
+    UNIQUE(well_no, read_at_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_readings_well ON well_readings(well_no, read_at_utc);
+
+-- Audit trail of reading registrations and corrections.
+CREATE TABLE IF NOT EXISTS well_reading_revisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_id      INTEGER NOT NULL REFERENCES well_readings(id),
+    well_no         TEXT NOT NULL,
+    action          TEXT NOT NULL,           -- create | correct
+    prev_json       TEXT,
+    new_json        TEXT NOT NULL,
+    reason          TEXT,
+    created_at_utc  TEXT NOT NULL
+);
+
+-- Persisted accounting runs, one row per calculation of
+-- (well_no, lab, analyte, day).  ``status`` lifecycle:
+--   current    -> the latest successful calculation, safe to serve
+--   expired    -> inputs changed underneath it (kept for audit, must be recalculated)
+--   superseded -> replaced by a newer successful recalculation
+-- ``inputs_token`` hashes the exact committed readings/samples/custody/
+-- measurement state the run was computed from (single-transaction basis).
+CREATE TABLE IF NOT EXISTS accounting_runs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    well_no            TEXT NOT NULL,
+    lab                TEXT NOT NULL,
+    analyte            TEXT NOT NULL,
+    day                TEXT NOT NULL,        -- YYYY-MM-DD (UTC)
+    carry_over_hours   REAL NOT NULL,
+    max_interval_hours REAL NOT NULL,
+    status             TEXT NOT NULL,        -- current | expired | superseded
+    inputs_token       TEXT NOT NULL,
+    removal_mass_g     REAL,                 -- NULL when nothing is determinable
+    complete           INTEGER NOT NULL,     -- 1 when no pending intervals
+    result_json        TEXT NOT NULL,
+    created_at_utc     TEXT NOT NULL,
+    expired_at_utc     TEXT,
+    expire_reason      TEXT,
+    superseded_at_utc  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_accounting_key ON accounting_runs(well_no, lab, analyte, day, status);
 """
 
 
