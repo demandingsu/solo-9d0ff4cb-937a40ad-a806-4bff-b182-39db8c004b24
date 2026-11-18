@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    image: gsb-sample-delivery:local
+    container_name: gsb-sample-delivery
+    ports:
+      - "${GSB_PORT:-8000}:8000"
+    environment:
+      GSB_DB_PATH: /data/gsb.sqlite3
+    volumes:
+      - gsb-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  gsb-data:
